@@ -4,7 +4,7 @@ import { query } from '../lib/db.js';
 const router = Router();
 
 const LEAD_FIELDS = [
-  'email', 'first_name', 'last_name', 'company', 'domain', 'niche',
+  'email', 'first_name', 'last_name', 'title', 'company', 'domain', 'niche',
   'city', 'country', 'source', 'signal', 'verified', 'catch_all',
   'status', 'enrichment',
 ];

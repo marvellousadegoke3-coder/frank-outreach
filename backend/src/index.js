@@ -10,6 +10,7 @@ import eventsRoutes from './routes/events.js';
 import suppressionRoutes from './routes/suppression.js';
 import webhookRoutes from './routes/webhook.js';
 import agentRoutes from './routes/agent.js';
+import sourceLeadsRoutes from './routes/sourceLeads.js';
 
 const app = express();
 
@@ -24,6 +25,7 @@ app.use(eventsRoutes);
 app.use(suppressionRoutes);
 app.use(webhookRoutes);
 app.use(agentRoutes);
+app.use(sourceLeadsRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'not found' });

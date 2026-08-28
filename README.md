@@ -58,7 +58,11 @@ npm run dev
    (optional — until all three are set, `/agent/run` logs drafted emails
    instead of sending them, so the pipeline runs safely before Gmail OAuth
    is set up; see **Sending via Gmail API** below for how to generate the
-   refresh token).
+   refresh token), `GOOGLE_PLACES_API_KEY` (required for `/leads/source`;
+   same Google Cloud project as the Gmail OAuth client, enable the "Places
+   API"), and `HUNTER_API_KEY` (optional for `/leads/source`; without it,
+   lead sourcing runs entirely on pattern-guessed emails — see **Lead
+   sourcing** below).
 6. Dashboard service — no extra env vars beyond `DATABASE_URL`.
 7. Generate a public domain for each service under Settings → Networking →
    "Generate Domain".
@@ -75,7 +79,8 @@ npm run dev
 | `PATCH /messages/:id/sent` | Mark a message sent |
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
 | `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
-| `POST /agent/run` | **The only endpoint n8n's cron calls.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
+| `POST /agent/run` | **n8n's daily send cron calls this.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
+| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via Google Places + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET` and `GOOGLE_PLACES_API_KEY` to be set. Returns a yield summary (`queries_run`, `places_found`, `hunter_calls_used`, `verified`, `inserted`, per-skip-reason counts, `errors`). |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
@@ -87,21 +92,82 @@ campaign's `daily_send_limit` (skipping once the day's cap is hit). A lead
 with no matching active campaign is skipped (`skipped_no_campaign`) — make
 sure every niche you're sending to has an active campaign row.
 
-## Known gap: no seniority filtering on leads
+## Lead sourcing (`POST /leads/source`)
 
-The drafting prompt assumes every lead is a decision-maker (CEO, founder,
-owner, or principal/managing partner) and writes founder-to-founder copy on
-that assumption — but the `leads` table has no `title`/`seniority` column,
-and nothing in this backend filters or verifies seniority. Right now
-whatever populates `leads` (lead sourcing/scraping isn't built yet) is
-implicitly responsible for only inserting decision-maker contacts.
+n8n's scraping cron calls this once daily. Pipeline per call:
 
-Before wiring up real lead sourcing, either add a `title` (or similar)
-column to `leads` and filter `/agent/run`'s candidate query on it, or at
-minimum have the sourcing step store the scraped title in `enrichment` and
-add that filter then. Until one of those exists, a non-decision-maker lead
-that slips into the table will still get founder-to-founder copy addressed
-to someone who isn't the owner.
+1. **Discovery** — rotates through a fixed list of business-type queries
+   (solar, moving, insurance, real estate, plumbing, landscaping, HVAC,
+   dental, law, ecommerce boutiques — see `QUERY_TEMPLATES` in
+   `backend/src/routes/sourceLeads.js`) crossed with a mix of US/UK cities,
+   deterministically offset by day-of-year so a daily cron works through new
+   ground instead of repeating itself. `PLACES_QUERIES_PER_RUN` (default 4)
+   caps how many query×city combos run per call; `PLACES_DETAILS_PER_RUN`
+   (default 25) caps the billable Place Details lookups per call.
+2. **Small-independent-business filter** — Places doesn't expose ownership
+   structure, so this is a heuristic: a business's total review count must
+   fall between 3 and 400 (enough to be a real active business, not so many
+   it's obviously a large chain). No website at all is skipped, not flagged
+   — there's no domain to derive or verify an email against, so nothing
+   downstream is actionable.
+3. **Owner contact** — Hunter.io domain search first (25 free searches/month
+   **total**, so it's spent only on businesses that already cleared the
+   filter above, capped per run by `HUNTER_MAX_CALLS_PER_RUN` (default 1)
+   and by the account's live remaining quota via Hunter's `/account`
+   endpoint), filtered to results with `seniority: executive` or a
+   CEO/founder/owner/president/principal/managing-partner title. If Hunter
+   finds nothing (or is unset/exhausted), falls back to pattern-guessing
+   `owner@domain`, then `<guessed-first-name>@domain` (only when the
+   business name looks personal, e.g. "Dave's Plumbing"), then `info@domain`
+   as a last resort — each guess run through the existing `/verify` logic
+   (MX check, Reoon fallback if `REOON_API_KEY` is set) before being
+   accepted.
+4. **Dedupe** — skipped if the business (name+city) or domain already exists
+   in `leads`, or the domain already appears in `suppression`.
+5. **Signal tagging** — `leads.signal` is populated with why the lead was
+   picked (e.g. `"solar companies, 47 reviews — no website found"`), which
+   is what the drafting prompt grounds copy in.
+6. No fixed target count — it runs the capped batch of query×city combos for
+   that call and reports real per-run yield in the JSON response.
+
+### Known gap: seniority confidence varies by contact method
+
+`leads.title` is populated when Hunter returns one (Hunter has actual title
+data), but the **pattern-guessing fallback path never confirms a real
+person or title** — `owner@domain` and `info@domain` are just plausible
+addresses that passed a mail-server-exists check, not evidence the mailbox
+belongs to an actual owner. `enrichment.contact_method` on each lead records
+which path found it (`"hunter"` vs `"pattern_guess"`), so you can see which
+leads have real seniority confidence and which are inferred from Places'
+review-count heuristic alone. The drafting prompt still writes
+founder-to-founder copy for every lead regardless of `contact_method` —
+tightening that (e.g. softer tone for `pattern_guess` leads, or skipping
+`info@` contacts from the founder-to-founder framing entirely) is a
+reasonable next step once you see real yield data.
+
+**Important caveat on pattern-guessed emails**: MX-only verification (no
+`REOON_API_KEY` set) only confirms the *domain* accepts mail — it cannot
+tell you a specific guessed mailbox like `owner@acme.com` actually exists.
+Nearly every guess will "pass" MX check even when wrong, which will surface
+later as bounces rather than upfront rejections. Setting `REOON_API_KEY`
+(power/SMTP-level verification) meaningfully tightens this and is strongly
+recommended before scaling up pattern-guessed volume.
+
+### Other free tools considered, not yet wired in
+
+- **Google Custom Search JSON API** (100 free queries/day) to detect hiring
+  signals directly (e.g. `site:indeed.com "front desk" "[company]"`) instead
+  of only inferring signal from Places metadata — highest-value addition,
+  but needs its own API key + Custom Search Engine setup. Recommend adding
+  as a follow-up once you've seen real yield/quality from the Places+Hunter
+  pipeline, not bundled into this first version.
+- **Yelp Fusion API** (free tier) as a second discovery source alongside
+  Places — some independent businesses have a Yelp presence without a
+  Google Business listing, or vice versa. Worth adding for coverage once
+  Places' yield plateaus.
+- **OpenCorporates API** (free tier, rate-limited) to sharpen the
+  independent-vs-franchise heuristic beyond the review-count proxy —
+  lower priority; the current heuristic is workable to start.
 
 ## Sending via Gmail API
 
@@ -149,15 +215,25 @@ inbound reply back to the right message via `In-Reply-To`/`References`.
 
 ## Connecting to n8n Cloud
 
-Once the backend has a public Railway domain, n8n's role is just one workflow:
+Once the backend has a public Railway domain, n8n has two cron workflows —
+both trivial, since the backend owns all the actual logic:
 
-1. **Schedule Trigger** node — set to run once daily (pick whatever time you
-   want sends to go out).
-2. **HTTP Request** node — `POST https://<backend-domain>/agent/run`, header
-   `x-webhook-secret: <your WEBHOOK_SECRET>`, no body needed.
+**1. Daily send** — decides who to email, drafts copy, sends, schedules
+follow-ups, all server-side:
+- **Schedule Trigger** node — once daily (pick whatever time you want sends
+  to go out).
+- **HTTP Request** node — `POST https://<backend-domain>/agent/run`, header
+  `x-webhook-secret: <your WEBHOOK_SECRET>`, no body needed.
 
-That's it. The backend decides who to email, drafts the copy, sends it, and
-schedules the next follow-up step on its own — n8n just has to fire the cron.
+**2. Daily lead sourcing** — discovers new leads via Places/Hunter and
+upserts qualifying ones:
+- **Schedule Trigger** node — once daily, ideally *before* the send cron so
+  freshly sourced leads are eligible for that day's send run.
+- **HTTP Request** node — `POST https://<backend-domain>/leads/source`,
+  header `x-webhook-secret: <your WEBHOOK_SECRET>`, no body needed.
+
+That's it for both. The backend decides everything — n8n just has to fire
+two crons.
 
 For inbound replies, point your inbox-monitoring trigger (IMAP/Gmail trigger
 node polling the sending inbox) at a workflow that ends with an HTTP Request
