@@ -77,7 +77,7 @@ npm run dev
 | `POST /messages` | Create a message record |
 | `PATCH /messages/:id/sent` | Mark a message sent |
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
-| `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
+| `POST /webhook/inbound` | n8n (or your inbox provider) posts everything that lands in the monitored sending inbox here — genuine replies **and** Gmail bounce/DSN notifications (bounces return to the sender, i.e. this same inbox). Auto-detects which it is (see **Bounce handling** below) and branches: a reply gets classified for sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment; a bounce marks the message/lead `status = 'bounced'` and adds the address to `suppression` instead — never runs a bounce through sentiment classification. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
 | `POST /agent/run` | **n8n's daily send cron calls this.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
 | `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. **Runs asynchronously** — responds immediately (`202 {"status":"started"}`) and does the actual work in the background; see **Lead sourcing** below for why and how to check results. |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
@@ -269,6 +269,47 @@ sends (step 2/3) look up the lead's most recent prior message and set
 `threadId` (stored in `messages.thread_id`) so the follow-up lands in the
 same Gmail conversation. This is what lets `/webhook/inbound` match an
 inbound reply back to the right message via `In-Reply-To`/`References`.
+
+## Bounce handling
+
+Gmail bounce notifications (DSNs) land in the same inbox the sending account
+uses — they're mail *to* the sender, not from the lead. If `/webhook/inbound`
+treated them like ordinary replies, they'd get run through sentiment
+classification (garbage in, garbage out) and mark a dead lead as
+`needs_human_reply` instead of suppressing it. Instead `backend/src/lib/bounce.js`
+detects them first via `looksLikeBounce()` — sender matches
+`mailer-daemon@`/`postmaster@`, or the subject matches common DSN patterns
+("Delivery Status Notification", "undelivered mail", etc.) — and branches to
+`handleBounce()` in `webhook.js` instead of the reply path.
+
+**Identifying which lead/message bounced**, in order of reliability:
+1. If n8n forwarded the raw `.eml` (so mailparser could see attachments):
+   Gmail typically embeds the original outbound message as a
+   `message/rfc822` attachment inside the DSN. `extractOriginalMessageId()`
+   scans it for our own `Message-ID` header and matches it directly against
+   `messages.message_id` — exact, no guessing.
+2. Otherwise (n8n sent already-flattened fields, or no attachment found):
+   `extractRecipientFromBounceText()` scans the bounce's free-text body for
+   an email address that isn't the bounce sender itself (Gmail's bounce text
+   typically reads "Your message wasn't delivered to x@y.com because...").
+   Weaker — could misfire if the body mentions a different address first —
+   but better than discarding the bounce.
+
+**On a resolved bounce**: `messages.status = 'bounced'`, `leads.status =
+'bounced'`, a `bounced` event is logged, and the address is added to
+`suppression` (reason `hard_bounce`) — this last part is what actually stops
+`/agent/run` from emailing it again, checked before every send regardless of
+`leads.status`. If neither extraction method resolves a lead (e.g. the
+bounce is for an address never in `leads` at all), the event is still logged
+with `lead_id`/`message_id` null for manual triage, and the response has
+`resolved: false`.
+
+**Caveat**: pattern-guessed emails from `/leads/source` (see **Lead
+sourcing** above) bounce more often than Hunter-sourced ones — MX-only
+verification only confirms the domain accepts mail, not that a specific
+guessed mailbox exists. This bounce handling is what closes that loop:
+every bounce a guessed address produces gets it suppressed automatically
+instead of silently wasting future sends.
 
 ## Connecting to n8n Cloud
 

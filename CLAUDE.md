@@ -35,7 +35,9 @@ this project deliberately moved away from.
 - `src/routes/leads.js` — `POST/GET /leads`, `PATCH /leads/:id/status`
 - `src/routes/sourceLeads.js` — `POST /leads/source` (lead discovery)
 - `src/routes/agent.js` — `POST /agent/run` (drafting + sending)
-- `src/routes/webhook.js` — `POST /webhook/inbound` (reply handling)
+- `src/routes/webhook.js` — `POST /webhook/inbound` (reply handling +
+  bounce/DSN detection, branches before sentiment classification)
+- `src/lib/bounce.js` — bounce detection + original-recipient extraction
 - `src/routes/verify.js`, `messages.js`, `events.js`, `suppression.js`, `health.js`
 - `src/lib/db.js` — pg pool + `query()` helper
 - `src/lib/gmail.js` — Gmail API send (OAuth refresh-token flow)
@@ -181,6 +183,28 @@ verification unless actually confirming an end-to-end behavior change.
 3. **MX-only email verification** (no `REOON_API_KEY` set) can't confirm a
    specific mailbox exists, only that the domain accepts mail — relevant
    both for pattern-guessed sourcing emails and for `/verify` generally.
+   This is exactly why pattern-guessed leads bounce more than Hunter-sourced
+   ones in practice (observed directly: 5 of 9 real sourced leads bounced,
+   all pattern-guessed). `/webhook/inbound`'s bounce handling (see Bounce
+   handling below) is the backstop for this, not a substitute for tightening
+   verification — if bounce rates stay high, set `REOON_API_KEY` rather than
+   relying on catching bounces after the fact.
+
+## Bounce handling (`POST /webhook/inbound`)
+
+Gmail DSNs land in the same monitored inbox as real replies (bounces return
+to the sender). `bounce.js`'s `looksLikeBounce()` checks first
+(mailer-daemon/postmaster sender, or common DSN subject patterns) and routes
+to `handleBounce()` instead of the sentiment-classification reply path —
+**don't let a bounce reach `classifySentiment()`**, it's not a human reply
+and burns an Anthropic call on garbage. Recipient resolution, in order:
+embedded `message/rfc822` attachment's `Message-ID` (exact match, only
+available if n8n forwards raw `.eml`) → regex-scanning the bounce body for
+an email address that isn't the DSN sender (weaker, only fallback). On
+resolution: `messages.status`/`leads.status = 'bounced'`, a `bounced` event,
+and — regardless of whether a lead was matched — the address goes into
+`suppression` (`hard_bounce`), which is what actually blocks `/agent/run`
+from resending. Full detail: README's **Bounce handling** section.
 
 ## Don't duplicate work already done
 

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { simpleParser } from 'mailparser';
 import { query } from '../lib/db.js';
 import { classifySentiment } from '../lib/sentiment.js';
+import { looksLikeBounce, extractOriginalMessageId, extractRecipientFromBounceText } from '../lib/bounce.js';
 
 const router = Router();
 
@@ -15,8 +16,95 @@ function extractEmail(addressField) {
   return addressField.value?.[0]?.address?.toLowerCase() ?? null;
 }
 
+// Marks the bounced message/lead and adds the dead address to suppression,
+// so /agent/run stops wasting sends on it. Note: this handles the message
+// row's status directly (unlike PATCH /messages/:id/bounced, which requires
+// knowing the message id already) because a bounce arrives with only an
+// email/thread to go on, not a message id.
+async function handleBounce({ res, parsedMail, subject, textBody, fromEmail }) {
+  try {
+    let message = null;
+    let lead = null;
+    let guessedEmail = null;
+
+    const originalMessageId = extractOriginalMessageId(parsedMail);
+    if (originalMessageId) {
+      const { rows } = await query(`SELECT * FROM messages WHERE message_id = $1 LIMIT 1`, [originalMessageId]);
+      message = rows[0] ?? null;
+    }
+
+    if (message) {
+      const { rows } = await query(`SELECT * FROM leads WHERE id = $1`, [message.lead_id]);
+      lead = rows[0] ?? null;
+    } else {
+      // No embedded original message to key off — fall back to guessing the
+      // recipient from the bounce's free-text body (see bounce.js caveat).
+      guessedEmail = extractRecipientFromBounceText(textBody, fromEmail);
+      if (guessedEmail) {
+        const { rows } = await query(`SELECT * FROM leads WHERE email = $1`, [guessedEmail]);
+        lead = rows[0] ?? null;
+        if (lead) {
+          const msgRows = await query(
+            `SELECT * FROM messages WHERE lead_id = $1 ORDER BY sent_at DESC NULLS LAST LIMIT 1`,
+            [lead.id]
+          );
+          message = msgRows.rows[0] ?? null;
+        }
+      }
+    }
+
+    const event = await query(
+      `INSERT INTO events (message_id, lead_id, type, raw, occurred_at)
+       VALUES ($1, $2, 'bounced', $3, now())
+       RETURNING *`,
+      [
+        message?.id ?? null,
+        lead?.id ?? null,
+        JSON.stringify({ from: fromEmail, subject, body: textBody, resolved: Boolean(lead) }),
+      ]
+    );
+
+    if (message) {
+      await query(`UPDATE messages SET status = 'bounced' WHERE id = $1`, [message.id]);
+    }
+    if (lead) {
+      await query(`UPDATE leads SET status = 'bounced', updated_at = now() WHERE id = $1`, [lead.id]);
+    }
+
+    // Suppression is what actually stops future sends (checked by
+    // /agent/run before every send) — add it even if we only recovered an
+    // email guess and never matched a lead row, so a bounce for an address
+    // that isn't in `leads` yet still can't get emailed later.
+    const suppressEmail = lead?.email ?? guessedEmail;
+    let suppressed = false;
+    if (suppressEmail) {
+      await query(
+        `INSERT INTO suppression (email, reason) VALUES ($1, 'hard_bounce') ON CONFLICT (email) DO NOTHING`,
+        [suppressEmail]
+      );
+      suppressed = true;
+    }
+
+    return res.status(201).json({
+      type: 'bounce',
+      resolved: Boolean(lead),
+      event: event.rows[0],
+      message_id: message?.id ?? null,
+      lead_id: lead?.id ?? null,
+      suppressed_email: suppressEmail ?? null,
+      suppressed,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 // POST /webhook/inbound
-// Called by n8n whenever a reply lands in a monitored inbox. Accepts either:
+// Called by n8n whenever anything lands in the monitored (sending) inbox —
+// a genuine reply, or a bounce/DSN notification (bounces come back to the
+// sender, i.e. this same inbox). Detects which case it is via
+// looksLikeBounce() and branches accordingly; see handleBounce() above.
+// Accepts either:
 //   { raw: "<full .eml source>" }                     -- parsed with mailparser
 //   { from, subject, text, html, in_reply_to, references, message_id }
 // Requires header `x-webhook-secret` to match WEBHOOK_SECRET when set.
@@ -28,15 +116,15 @@ router.post('/webhook/inbound', async (req, res) => {
   }
 
   try {
-    let fromEmail, subject, textBody, inReplyTo, references;
+    let fromEmail, subject, textBody, inReplyTo, references, parsedMail;
 
     if (req.body?.raw) {
-      const parsed = await simpleParser(req.body.raw);
-      fromEmail = extractEmail(parsed.from);
-      subject = parsed.subject ?? '';
-      textBody = parsed.text ?? parsed.html ?? '';
-      inReplyTo = parsed.inReplyTo ?? null;
-      references = Array.isArray(parsed.references) ? parsed.references : (parsed.references ? [parsed.references] : []);
+      parsedMail = await simpleParser(req.body.raw);
+      fromEmail = extractEmail(parsedMail.from);
+      subject = parsedMail.subject ?? '';
+      textBody = parsedMail.text ?? parsedMail.html ?? '';
+      inReplyTo = parsedMail.inReplyTo ?? null;
+      references = Array.isArray(parsedMail.references) ? parsedMail.references : (parsedMail.references ? [parsedMail.references] : []);
     } else {
       const b = req.body || {};
       fromEmail = extractEmail(b.from);
@@ -48,6 +136,16 @@ router.post('/webhook/inbound', async (req, res) => {
 
     if (!fromEmail) {
       return res.status(400).json({ error: 'could not determine sender email' });
+    }
+
+    // Bounce/DSN notifications land in the same monitored inbox as real
+    // replies, so this has to branch before the reply-handling path below —
+    // otherwise a bounce gets run through sentiment classification like a
+    // genuine human reply, corrupting events with junk sentiment and (worse)
+    // marking the dead lead as needing a human follow-up instead of
+    // suppressing it.
+    if (looksLikeBounce({ fromEmail, subject })) {
+      return handleBounce({ res, parsedMail, subject, textBody, fromEmail });
     }
 
     // Try to find the outbound message this is a reply to, by thread/message id.
