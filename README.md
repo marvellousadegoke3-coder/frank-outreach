@@ -79,7 +79,7 @@ npm run dev
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
 | `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
 | `POST /agent/run` | **n8n's daily send cron calls this.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
-| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a yield summary (`queries_run`, `businesses_found`, `hunter_calls_used`, `verified`, `inserted`, per-skip-reason counts, `errors`). |
+| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a yield summary (`queries_run`, `businesses_found`, `hunter_calls_used`, `verified`, `inserted`, `campaigns_auto_created`, per-skip-reason counts, `errors`). |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
@@ -88,8 +88,11 @@ npm run dev
 Note: `/agent/run` picks a campaign for each lead by matching `campaigns.niche`
 to the lead's `niche` where `campaigns.status = 'active'`, and respects that
 campaign's `daily_send_limit` (skipping once the day's cap is hit). A lead
-with no matching active campaign is skipped (`skipped_no_campaign`) — make
-sure every niche you're sending to has an active campaign row.
+with no matching active campaign is skipped (`skipped_no_campaign`) —
+`/leads/source` auto-creates one the first time it sources a lead in a
+brand-new niche (see **Lead sourcing** below), so this only bites if you're
+inserting leads into `/leads` directly with a niche `/leads/source` has
+never encountered, or if you manually paused the campaign it created.
 
 ## Lead sourcing (`POST /leads/source`)
 
@@ -140,7 +143,16 @@ n8n's scraping cron calls this once daily. Pipeline per call:
    picked (e.g. `"independent solar companies — no major brand/chain
    affiliation found (OpenStreetMap)"`), which is what the drafting prompt
    grounds copy in.
-6. No fixed target count — it runs the capped batch of query×city combos for
+6. **Auto-creates a campaign for brand-new niches** — right before inserting
+   a lead, if `campaigns` has no row at all for that niche (any status),
+   one is created: `name = "<query label> — Auto"`, `status = 'active'`,
+   `daily_send_limit = AUTO_CAMPAIGN_DAILY_SEND_LIMIT` (default 20). Logged
+   via `console.log` and listed in the response's `campaigns_auto_created`
+   array. This is what keeps sourcing and sending fully hands-off — a newly
+   discovered niche starts getting emailed by the next `/agent/run` without
+   you manually inserting a campaign row. If a campaign for that niche
+   already exists (even paused), no duplicate is created.
+7. No fixed target count — it runs the capped batch of query×city combos for
    that call and reports real per-run yield in the JSON response.
 
 ### Known gap: seniority confidence varies by contact method

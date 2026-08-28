@@ -107,11 +107,31 @@ falling back.
 OpenStreetMap Overpass API (discovery, free/no key) → independent-business
 heuristic (no `brand` tag) → owner contact via Hunter.io (decision-maker titles
 only) or pattern-guessing (`owner@`/`<guessed-firstname>@`/`info@`,
-MX/Reoon-verified) → dedupe → insert with a `signal` describing why the lead
-was picked. No fixed target count per run; yield is whatever the capped
+MX/Reoon-verified) → dedupe → **auto-create an active `campaigns` row if the
+lead's niche has none at all** (`name = "<label> — Auto"`,
+`daily_send_limit = AUTO_CAMPAIGN_DAILY_SEND_LIMIT`, default 20; logged via
+`console.log` and returned in the response's `campaigns_auto_created` array)
+→ insert lead with a `signal` describing why it was picked. This is what
+keeps `/leads/source` and `/agent/run` fully hands-off — a newly sourced
+niche gets an active campaign automatically instead of silently piling up
+leads `/agent/run` has nowhere to send (this resolves Known Gap #2 below).
+Only skips auto-create when a campaign row for that niche already exists in
+**any** status, so a manually paused campaign is never shadowed by a
+duplicate. No fixed target count per run; yield is whatever the capped
 query×city batch produces. Full pipeline detail: see README's **Lead
 sourcing** section — don't duplicate that detail here, keep this file to
 what a fresh session needs to orient itself, not the full spec.
+
+**Known reliability issue (observed directly, not fixed — external)**:
+overpass-api.de (the free public Overpass instance) is intermittently
+overloaded — the exact same cheap query returned 504, then 200, then 504
+within a few seconds of each other during testing. `osm.js` already retries
+with backoff (2 retries, 3s/8s delays), and each failed query is caught and
+logged per-combo without failing the whole run — but a `/leads/source` call
+can legitimately take several minutes if Overpass is having a bad day. Make
+sure n8n's HTTP Request node timeout for this workflow is generous (10
+min+), not the default. If this becomes a persistent problem, consider a
+paid/self-hosted Overpass instance — not worth doing preemptively.
 
 **Known gap**: pattern-guessed leads (no Hunter hit) never confirm a real
 person exists at that address or their actual title — `leads.title` stays
@@ -144,14 +164,13 @@ verification unless actually confirming an end-to-end behavior change.
 
 1. **Pattern-guessed leads have no seniority confirmation** — see Lead
    sourcing section above.
-2. **`/agent/run`'s campaign matching requires an active `campaigns` row
-   per niche** — sourced leads get a `niche` slug (e.g. `solar`,
-   `real_estate`) from `QUERY_TEMPLATES` in `sourceLeads.js`; if no
-   `campaigns` row exists with a matching `niche` and `status = 'active'`,
-   those leads are silently skipped by `/agent/run` (`skipped_no_campaign`
-   in its response summary). Check this whenever sourcing yield looks fine
-   but send yield doesn't — it usually means a missing campaign row, not a
-   pipeline bug.
+2. ~~`/agent/run`'s campaign matching requires an active `campaigns` row per
+   niche~~ — **resolved**: `/leads/source` now auto-creates an active
+   campaign the first time it sources a lead in a niche with no campaign row
+   at all (see Lead sourcing section above). If sourcing yield looks fine
+   but send yield doesn't, it's no longer a missing-campaign issue by
+   default — check `campaigns.status` (someone may have manually paused it)
+   or `campaigns.daily_send_limit` instead.
 3. **MX-only email verification** (no `REOON_API_KEY` set) can't confirm a
    specific mailbox exists, only that the domain accepts mail — relevant
    both for pattern-guessed sourcing emails and for `/verify` generally.

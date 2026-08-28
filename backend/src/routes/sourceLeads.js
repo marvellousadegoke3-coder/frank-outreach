@@ -48,6 +48,30 @@ const QUERIES_PER_RUN = envInt('OSM_QUERIES_PER_RUN', 4);
 const ELEMENTS_PER_RUN = envInt('OSM_ELEMENTS_PER_RUN', 25);
 const RADIUS_METERS = envInt('OSM_RADIUS_METERS', 12000);
 const HUNTER_MAX_CALLS_PER_RUN = envInt('HUNTER_MAX_CALLS_PER_RUN', 1);
+const AUTO_CAMPAIGN_DAILY_SEND_LIMIT = envInt('AUTO_CAMPAIGN_DAILY_SEND_LIMIT', 20);
+
+// /agent/run only sends into a niche if an active campaign row exists for
+// it. Without this, a newly sourced niche would sit unsent until someone
+// manually adds a campaign — defeating the point of an unattended pipeline.
+// Only creates one when NO campaign row exists for the niche at all (any
+// status), so a deliberately paused/manual campaign is never shadowed by an
+// auto-created duplicate.
+async function ensureCampaignForNiche(niche, label, ensuredNiches, summary) {
+  if (ensuredNiches.has(niche)) return;
+  ensuredNiches.add(niche);
+
+  const { rows } = await query(`SELECT 1 FROM campaigns WHERE niche = $1 LIMIT 1`, [niche]);
+  if (rows.length) return;
+
+  const name = `${label.charAt(0).toUpperCase()}${label.slice(1)} — Auto`;
+  await query(
+    `INSERT INTO campaigns (name, niche, status, daily_send_limit) VALUES ($1, $2, 'active', $3)`,
+    [name, niche, AUTO_CAMPAIGN_DAILY_SEND_LIMIT]
+  );
+  const note = `auto-created campaign "${name}" for niche "${niche}" (daily_send_limit=${AUTO_CAMPAIGN_DAILY_SEND_LIMIT})`;
+  console.log(`[leads/source] ${note}`);
+  summary.campaigns_auto_created.push(note);
+}
 
 function dayOfYear() {
   const now = new Date();
@@ -109,8 +133,10 @@ router.post('/leads/source', async (req, res) => {
     verified: 0,
     skipped_no_email_found: 0,
     inserted: 0,
+    campaigns_auto_created: [],
     errors: [],
   };
+  const ensuredNiches = new Set();
 
   let hunterCallsRemainingThisRun = HUNTER_MAX_CALLS_PER_RUN;
   if (hunterConfigured()) {
@@ -223,6 +249,8 @@ router.post('/leads/source', async (req, res) => {
           continue;
         }
         summary.verified++;
+
+        await ensureCampaignForNiche(q.niche, q.label, ensuredNiches, summary);
 
         await query(
           `INSERT INTO leads
