@@ -199,10 +199,13 @@ async function runSourcingJob() {
         const signal = buildSignal(q.label);
 
         let contact = null;
+        let verification = null; // set inline when the pattern-guess loop already verified it
 
         // Hunter is scarce (25/month total) — only spend it on businesses
         // that already cleared the independent-business filter above, and
         // only while this run's budget and the account's live quota allow.
+        // Hunter-found addresses are data-mined, not verified, so they still
+        // need the verifyEmail() call below.
         if (hunterConfigured() && hunterCallsRemainingThisRun > 0) {
           hunterCallsRemainingThisRun--;
           summary.hunter_calls_used++;
@@ -219,16 +222,17 @@ async function runSourcingJob() {
 
         // Fall back to pattern guessing when Hunter found nothing (or was
         // skipped/exhausted). Each guess still has to pass verifyEmail() —
-        // note MX-only verification confirms the *domain* accepts mail, not
-        // that this specific mailbox exists, so this is weaker signal than a
-        // Hunter hit or a Reoon-backed verification (set REOON_API_KEY to
-        // tighten this).
+        // MX-only confirms the *domain* accepts mail, not that this specific
+        // mailbox exists; setting REOON_API_KEY upgrades this same call to
+        // real SMTP-level mailbox verification (verifyEmail() already tries
+        // Reoon automatically whenever that key is set — no extra wiring).
         if (!contact) {
           for (const guess of candidateEmails(domain, business.name)) {
             summary.pattern_guesses_tried++;
             const result = await verifyEmail(guess);
             if (result.verified) {
               contact = { email: guess, firstName: null, lastName: null, title: null };
+              verification = result; // already verified above — don't spend a second (Reoon, paid) call on it below
               break;
             }
           }
@@ -239,7 +243,12 @@ async function runSourcingJob() {
           continue;
         }
 
-        const verification = await verifyEmail(contact.email);
+        // Hunter-sourced contacts reach here unverified; pattern-guessed
+        // ones were already verified in the loop above and shouldn't pay
+        // for a redundant second Reoon call on the same address.
+        if (!verification) {
+          verification = await verifyEmail(contact.email);
+        }
         if (!verification.verified) {
           summary.skipped_no_email_found++;
           continue;
