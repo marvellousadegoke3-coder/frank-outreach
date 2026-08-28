@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { query } from '../lib/db.js';
 import { draftMessage } from '../lib/draftCopy.js';
-import { sendMail } from '../lib/mailer.js';
+import { sendMail } from '../lib/gmail.js';
 
 const router = Router();
 
@@ -47,8 +47,9 @@ function pickStep(lead) {
 }
 
 // POST /agent/run — the single endpoint n8n's daily cron calls. Selects due
-// leads, checks suppression, drafts copy, sends via SMTP (or logs a stub if
-// SMTP isn't configured yet), and logs the message + a 'sent' event.
+// leads, checks suppression, drafts copy, sends via the Gmail API (or logs a
+// stub if Google OAuth env vars aren't configured yet), and logs the
+// message + a 'sent' event.
 router.post('/agent/run', async (req, res) => {
   if (process.env.WEBHOOK_SECRET) {
     if (req.get('x-webhook-secret') !== process.env.WEBHOOK_SECRET) {
@@ -105,22 +106,38 @@ router.post('/agent/run', async (req, res) => {
           }
         }
 
+        // For follow-ups, thread off the immediately prior message: its
+        // RFC822 Message-ID drives In-Reply-To/References, and its Gmail
+        // threadId keeps the new send in the same Gmail conversation.
+        let prevMessage = null;
+        if (step > 1) {
+          const { rows: prevRows } = await query(
+            `SELECT message_id, thread_id FROM messages
+             WHERE lead_id = $1 ORDER BY sent_at DESC NULLS LAST LIMIT 1`,
+            [lead.id]
+          );
+          prevMessage = prevRows[0] ?? null;
+        }
+
         const draft = await draftMessage({ step, lead });
-        const fromAddress = campaign.from_inbox || process.env.SMTP_USER || 'noreply@example.com';
+        const fromAddress = campaign.from_inbox || process.env.GOOGLE_SEND_AS || 'noreply@example.com';
 
         const mailResult = await sendMail({
           from: fromAddress,
           to: lead.email,
           subject: draft.subject,
           text: draft.body,
+          inReplyTo: prevMessage?.message_id ?? undefined,
+          references: prevMessage?.message_id ?? undefined,
+          threadId: prevMessage?.thread_id ?? undefined,
         });
 
         const { rows: msgRows } = await query(
           `INSERT INTO messages
-            (lead_id, campaign_id, step, subject, body, inbox_used, message_id, sent_at, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7, now(), 'sent')
+            (lead_id, campaign_id, step, subject, body, inbox_used, message_id, thread_id, sent_at, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now(), 'sent')
            RETURNING *`,
-          [lead.id, campaign.id, step, draft.subject, draft.body, fromAddress, mailResult.messageId]
+          [lead.id, campaign.id, step, draft.subject, draft.body, fromAddress, mailResult.messageId, mailResult.threadId]
         );
         const message = msgRows[0];
 

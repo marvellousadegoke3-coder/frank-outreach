@@ -54,9 +54,11 @@ npm run dev
    fixed template and sentiment falls back to a keyword heuristic),
    `REOON_API_KEY` (optional, enables verification fallback), `CORS_ORIGIN`
    (set to your dashboard's Railway URL once you have it, or leave `*`),
-   and `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS` (optional — until
-   these are set, `/agent/run` logs drafted emails instead of sending them,
-   so the whole pipeline runs safely before your mailbox is ready).
+   and `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REFRESH_TOKEN`
+   (optional — until all three are set, `/agent/run` logs drafted emails
+   instead of sending them, so the pipeline runs safely before Gmail OAuth
+   is set up; see **Sending via Gmail API** below for how to generate the
+   refresh token).
 6. Dashboard service — no extra env vars beyond `DATABASE_URL`.
 7. Generate a public domain for each service under Settings → Networking →
    "Generate Domain".
@@ -73,7 +75,7 @@ npm run dev
 | `PATCH /messages/:id/sent` | Mark a message sent |
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
 | `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
-| `POST /agent/run` | **The only endpoint n8n's cron calls.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via SMTP (or logs a stub without SMTP creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
+| `POST /agent/run` | **The only endpoint n8n's cron calls.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
@@ -84,6 +86,50 @@ to the lead's `niche` where `campaigns.status = 'active'`, and respects that
 campaign's `daily_send_limit` (skipping once the day's cap is hit). A lead
 with no matching active campaign is skipped (`skipped_no_campaign`) — make
 sure every niche you're sending to has an active campaign row.
+
+## Sending via Gmail API
+
+`/agent/run` sends through the Gmail API (`users.messages.send`) using an
+OAuth refresh token, not SMTP. Until `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+and `GOOGLE_REFRESH_TOKEN` are all set on the backend service, sends are
+logged instead of actually delivered.
+
+**Prerequisites in Google Cloud Console** (same project as your OAuth client):
+- Enable the **Gmail API** for the project.
+- On the OAuth consent screen, add the sending Gmail account as a **test
+  user** if the app is still in "Testing" publishing status (otherwise
+  Google blocks the consent screen).
+
+**One-time authorization** — run this locally, from `backend/`:
+
+```bash
+GOOGLE_CLIENT_ID=<your client id> GOOGLE_CLIENT_SECRET=<your client secret> node scripts/gmail-auth.js
+```
+
+It prints a Google consent URL (and tries to open it automatically on
+macOS). Open it, sign into the **Gmail account you want to send from**, and
+approve access. The script runs a temporary local server to catch the
+redirect automatically — no manual code copy/paste needed — then prints a
+refresh token. Set that as `GOOGLE_REFRESH_TOKEN` on the backend service
+(along with `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`), e.g.:
+
+```bash
+railway variable --service <backend-service> --set "GOOGLE_CLIENT_ID=..." \
+  --set "GOOGLE_CLIENT_SECRET=..." --set "GOOGLE_REFRESH_TOKEN=..."
+```
+
+**From address**: each send uses the sending campaign's `from_inbox` as the
+`From` header (falling back to `GOOGLE_SEND_AS` if unset). That address must
+be either the authorized Gmail account itself or a verified "Send As" alias
+on it (Gmail Settings → Accounts → Send mail as).
+
+**Reply threading**: every send mints its own `Message-ID` header (stored in
+`messages.message_id`) rather than relying on Gmail's API id. Follow-up
+sends (step 2/3) look up the lead's most recent prior message and set
+`In-Reply-To`/`References` to its `Message-ID`, and pass its Gmail
+`threadId` (stored in `messages.thread_id`) so the follow-up lands in the
+same Gmail conversation. This is what lets `/webhook/inbound` match an
+inbound reply back to the right message via `In-Reply-To`/`References`.
 
 ## Connecting to n8n Cloud
 
