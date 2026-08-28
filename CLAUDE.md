@@ -122,16 +122,23 @@ query×city batch produces. Full pipeline detail: see README's **Lead
 sourcing** section — don't duplicate that detail here, keep this file to
 what a fresh session needs to orient itself, not the full spec.
 
-**Known reliability issue (observed directly, not fixed — external)**:
-overpass-api.de (the free public Overpass instance) is intermittently
-overloaded — the exact same cheap query returned 504, then 200, then 504
-within a few seconds of each other during testing. `osm.js` already retries
-with backoff (2 retries, 3s/8s delays), and each failed query is caught and
-logged per-combo without failing the whole run — but a `/leads/source` call
-can legitimately take several minutes if Overpass is having a bad day. Make
-sure n8n's HTTP Request node timeout for this workflow is generous (10
-min+), not the default. If this becomes a persistent problem, consider a
-paid/self-hosted Overpass instance — not worth doing preemptively.
+**`/leads/source` is asynchronous — this is deliberate, don't "fix" it back
+to synchronous.** overpass-api.de (the free public Overpass instance) is
+intermittently overloaded — the exact same cheap query has been observed
+returning 504, then 200, then 504 within a few seconds of each other.
+`osm.js` retries with backoff (2 retries, 3s/8s delays), and this used to
+mean a `/leads/source` call could take several minutes on a bad Overpass
+day. That caused real 502s in production: Node's own default 5-minute
+`http.Server` request timeout killed the connection mid-flight (Railway's
+platform max is a documented 15 minutes — it wasn't Railway's edge at
+fault), and Railway's proxy surfaced the dropped connection as a 502 to the
+caller. Fix: the route now responds `202` immediately and runs the actual
+work in the background (single in-memory `sourcingInProgress` flag guards
+against overlapping runs — fine at one replica, would need a DB-backed lock
+if this service is ever scaled horizontally). Check `leads`/`campaigns` for
+results or `railway logs` for `[leads/source] run complete: {...}` — there
+is intentionally no status-polling endpoint. Full reasoning: README's **Why
+this endpoint is asynchronous**.
 
 **Known gap**: pattern-guessed leads (no Hunter hit) never confirm a real
 person exists at that address or their actual title — `leads.title` stays

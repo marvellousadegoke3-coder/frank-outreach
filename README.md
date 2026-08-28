@@ -79,7 +79,7 @@ npm run dev
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
 | `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
 | `POST /agent/run` | **n8n's daily send cron calls this.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
-| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a yield summary (`queries_run`, `businesses_found`, `hunter_calls_used`, `verified`, `inserted`, `campaigns_auto_created`, per-skip-reason counts, `errors`). |
+| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. **Runs asynchronously** — responds immediately (`202 {"status":"started"}`) and does the actual work in the background; see **Lead sourcing** below for why and how to check results. |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
@@ -153,7 +153,38 @@ n8n's scraping cron calls this once daily. Pipeline per call:
    you manually inserting a campaign row. If a campaign for that niche
    already exists (even paused), no duplicate is created.
 7. No fixed target count — it runs the capped batch of query×city combos for
-   that call and reports real per-run yield in the JSON response.
+   that call.
+
+### Why this endpoint is asynchronous
+
+Overpass's latency is too unpredictable to fit reliably inside a single
+request/response cycle — the exact same query has been observed returning
+`200`, then `504`, then `200` again within seconds of each other during
+testing. A synchronous version of this endpoint hit real 502s in production
+once Overpass had a slow run: the request/response socket got killed by
+Node's own default 5-minute `http.Server` request timeout partway through
+(not Railway's edge — Railway's platform max is a documented 15 minutes),
+and Railway's proxy surfaced that as a 502 to the caller. No fixed batch
+size can *reliably* dodge this, since even one Overpass query can take over
+a minute once retries kick in, and a "safe" batch size today could still
+blow the same budget on a worse day.
+
+So `POST /leads/source` responds immediately —
+`202 {"status": "started", ...}` — and does the actual discovery/verify/
+insert work in the background after responding. There's deliberately no
+separate status-polling endpoint: check the `leads`/`campaigns` tables for
+results, or `railway logs` for the full per-run summary (logged as
+`[leads/source] run complete: {...}` with the same fields the old synchronous
+response used to return directly). A second call while one is already
+running gets `200 {"status": "already_running"}` instead of starting an
+overlapping job — this relies on a single in-memory flag, which only works
+correctly because this service runs as one Railway replica; if it's ever
+scaled horizontally, that guard needs to move to a DB-backed lock.
+
+**n8n side**: no timeout tuning needed for this specific 502 anymore (the
+call returns in milliseconds either way), but the workflow shouldn't expect
+the response to reflect finished work — treat `POST /leads/source` as
+"kick off today's sourcing run," not "wait for today's yield."
 
 ### Known gap: seniority confidence varies by contact method
 

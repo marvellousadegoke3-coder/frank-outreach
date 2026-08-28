@@ -106,20 +106,16 @@ function buildSignal(queryLabel) {
   return `independent ${queryLabel} — no major brand/chain affiliation found (OpenStreetMap)`;
 }
 
-// POST /leads/source — n8n's daily scraping cron calls this. Discovers small
-// businesses via OpenStreetMap's Overpass API (free, no key/billing), filters
-// for a plausible independent-owner profile, finds a decision-maker email
-// (Hunter first when it clears the quality bar and quota allows, else
-// pattern-guessing verified via MX/Reoon), and upserts qualifying leads. No
-// fixed target count — runs a capped batch of query x city combos per call
-// and reports real yield.
-router.post('/leads/source', async (req, res) => {
-  if (process.env.WEBHOOK_SECRET) {
-    if (req.get('x-webhook-secret') !== process.env.WEBHOOK_SECRET) {
-      return res.status(401).json({ error: 'invalid webhook secret' });
-    }
-  }
+// Overpass's latency is too unpredictable to fit any fixed batch size inside
+// a request/response cycle reliably (the exact same query has been observed
+// returning 200, then 504, then 200 within seconds of each other) — so this
+// runs as a fire-and-forget background job instead of a synchronous request.
+// A single in-memory flag is enough to prevent overlapping runs because this
+// service runs as one Railway replica; if it's ever scaled horizontally,
+// this needs to move to a DB-backed lock instead.
+let sourcingInProgress = false;
 
+async function runSourcingJob() {
   const summary = {
     queries_run: 0,
     businesses_found: 0,
@@ -288,7 +284,47 @@ router.post('/leads/source', async (req, res) => {
     }
   }
 
-  res.json(summary);
+  return summary;
+}
+
+// POST /leads/source — n8n's daily scraping cron calls this. Discovers small
+// businesses via OpenStreetMap's Overpass API (free, no key/billing), filters
+// for a plausible independent-owner profile, finds a decision-maker email
+// (Hunter first when it clears the quality bar and quota allows, else
+// pattern-guessing verified via MX/Reoon), and upserts qualifying leads. No
+// fixed target count — runs a capped batch of query x city combos per call.
+//
+// Responds immediately (202) and runs the actual sourcing work in the
+// background — see the comment on `sourcingInProgress` above for why.
+// There is no separate status endpoint by design: check `leads`/`campaigns`
+// for results, or `railway logs` for the full per-run summary (logged as
+// "[leads/source] run complete").
+router.post('/leads/source', async (req, res) => {
+  if (process.env.WEBHOOK_SECRET) {
+    if (req.get('x-webhook-secret') !== process.env.WEBHOOK_SECRET) {
+      return res.status(401).json({ error: 'invalid webhook secret' });
+    }
+  }
+
+  if (sourcingInProgress) {
+    return res.status(200).json({
+      status: 'already_running',
+      message: 'A /leads/source run is already in progress. Check the leads/campaigns tables or Railway logs once it finishes.',
+    });
+  }
+
+  sourcingInProgress = true;
+  res.status(202).json({
+    status: 'started',
+    message: 'Lead sourcing started in the background. Overpass latency varies run to run — check the leads/campaigns tables afterward, or `railway logs` for the full per-run summary.',
+  });
+
+  runSourcingJob()
+    .then((summary) => console.log('[leads/source] run complete:', JSON.stringify(summary)))
+    .catch((err) => console.error('[leads/source] run failed:', err))
+    .finally(() => {
+      sourcingInProgress = false;
+    });
 });
 
 export default router;
