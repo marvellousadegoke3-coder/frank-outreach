@@ -36,7 +36,11 @@ export async function searchBusinesses({ osmFilter, lat, lon, radius }) {
       const data = await res.json();
       return normalizeElements(data.elements);
     } catch (err) {
-      lastError = err;
+      // `fetch` throws a generic "fetch failed" for network-level errors
+      // (DNS, TLS, connection refused) with the real reason nested in
+      // `.cause` — surface it, since "fetch failed" alone isn't
+      // diagnosable from logs.
+      lastError = err.cause ? new Error(`${err.message}: ${err.cause.message ?? err.cause}`) : err;
       if (attempt < RETRY_DELAYS_MS.length) await sleep(RETRY_DELAYS_MS[attempt]);
     }
   }
