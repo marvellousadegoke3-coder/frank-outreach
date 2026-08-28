@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Frank Digitals — Outreach Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #151822;
+    --border: #262b3a;
+    --text: #e6e9f0;
+    --muted: #8b90a3;
+    --accent: #6ea8fe;
+    --good: #4ade80;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 32px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 14px;
+    margin-bottom: 32px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 28px; font-weight: 600; margin-top: 6px; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 32px;
+  }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  section h2 { font-size: 14px; margin: 0 0 16px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+  #err { color: var(--bad); font-size: 13px; margin-bottom: 16px; display: none; }
+</style>
+</head>
+<body>
+  <h1>Frank Digitals — Outreach Dashboard</h1>
+  <div class="sub" id="generatedAt">Loading…</div>
+  <div id="err"></div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="grid2">
+    <section>
+      <h2>Per campaign</h2>
+      <table id="campaignTable">
+        <thead>
+          <tr><th>Campaign</th><th>Niche</th><th>Sent</th><th>Delivered</th><th>Bounced</th><th>Replied</th><th>Positive</th><th>Meetings</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Per niche</h2>
+      <canvas id="nicheChart" height="220"></canvas>
+    </section>
+  </div>
+
+  <section>
+    <h2>Niche breakdown</h2>
+    <table id="nicheTable">
+      <thead>
+        <tr><th>Niche</th><th>Sent</th><th>Delivered</th><th>Bounced</th><th>Replied</th><th>Positive</th><th>Meetings</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <script>
+    const CARD_DEFS = [
+      { key: 'sent', label: 'Sent' },
+      { key: 'delivered', label: 'Delivered' },
+      { key: 'bounced', label: 'Bounced' },
+      { key: 'replied', label: 'Replied' },
+      { key: 'positive', label: 'Positive replies' },
+      { key: 'meetings', label: 'Meetings booked' },
+    ];
+
+    function renderCards(totals) {
+      const el = document.getElementById('cards');
+      el.innerHTML = CARD_DEFS.map(d => `
+        <div class="card">
+          <div class="label">${d.label}</div>
+          <div class="value">${(totals[d.key] ?? 0).toLocaleString()}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderCampaignTable(rows) {
+      const tbody = document.querySelector('#campaignTable tbody');
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="empty">No campaigns yet</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${escapeHtml(r.campaign_name ?? '—')}</td>
+          <td>${escapeHtml(r.niche ?? '—')}</td>
+          <td>${r.sent}</td><td>${r.delivered}</td><td>${r.bounced}</td>
+          <td>${r.replied}</td><td>${r.positive}</td><td>${r.meetings}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderNicheTable(rows) {
+      const tbody = document.querySelector('#nicheTable tbody');
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">No data yet</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${escapeHtml(r.niche ?? '—')}</td>
+          <td>${r.sent}</td><td>${r.delivered}</td><td>${r.bounced}</td>
+          <td>${r.replied}</td><td>${r.positive}</td><td>${r.meetings}</td>
+        </tr>
+      `).join('');
+    }
+
+    let nicheChart;
+    function renderNicheChart(rows) {
+      const ctx = document.getElementById('nicheChart');
+      const labels = rows.map(r => r.niche ?? 'unknown');
+      const datasets = [
+        { label: 'Sent', data: rows.map(r => r.sent), backgroundColor: '#6ea8fe' },
+        { label: 'Replied', data: rows.map(r => r.replied), backgroundColor: '#4ade80' },
+        { label: 'Meetings', data: rows.map(r => r.meetings), backgroundColor: '#f0b429' },
+      ];
+      if (nicheChart) nicheChart.destroy();
+      nicheChart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          scales: {
+            x: { ticks: { color: '#8b90a3' }, grid: { color: '#262b3a' } },
+            y: { ticks: { color: '#8b90a3' }, grid: { color: '#262b3a' }, beginAtZero: true },
+          },
+          plugins: { legend: { labels: { color: '#e6e9f0' } } },
+        },
+      });
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    async function load() {
+      try {
+        const res = await fetch('/api/stats');
+        if (!res.ok) throw new Error('request failed: ' + res.status);
+        const data = await res.json();
+        document.getElementById('generatedAt').textContent = 'Updated ' + new Date(data.generatedAt).toLocaleString();
+        renderCards(data.totals);
+        renderCampaignTable(data.byCampaign);
+        renderNicheTable(data.byNiche);
+        renderNicheChart(data.byNiche);
+      } catch (err) {
+        const e = document.getElementById('err');
+        e.style.display = 'block';
+        e.textContent = 'Failed to load stats: ' + err.message;
+      }
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>
