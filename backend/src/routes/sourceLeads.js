@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query } from '../lib/db.js';
-import { searchPlaces, getPlaceDetails, placesConfigured } from '../lib/places.js';
+import { searchBusinesses, looksLikeIndependentBusiness } from '../lib/osm.js';
 import { getHunterQuota, hunterDomainSearch, hunterConfigured } from '../lib/hunter.js';
 import { candidateEmails } from '../lib/emailGuess.js';
 import { verifyEmail } from '../lib/verify.js';
@@ -8,48 +8,45 @@ import { verifyEmail } from '../lib/verify.js';
 const router = Router();
 
 // Business-type queries, not tied to one niche — cast wide. `niche` is the
-// slug stored on the lead row; `label` is what gets interpolated into the
-// Places text search.
+// slug stored on the lead row. `osmFilter` is an Overpass QL selector body
+// (missing the trailing `(around:...)` clause, added at query time) — tag
+// matches where a standard OSM tag exists, name-regex matches otherwise
+// (solar/moving have no widely-adopted dedicated OSM tag).
 const QUERY_TEMPLATES = [
-  { niche: 'solar', label: 'solar companies' },
-  { niche: 'moving', label: 'moving companies' },
-  { niche: 'insurance', label: 'insurance agencies' },
-  { niche: 'real_estate', label: 'real estate agents' },
-  { niche: 'plumbing', label: 'plumbing companies' },
-  { niche: 'landscaping', label: 'landscaping companies' },
-  { niche: 'hvac', label: 'hvac companies' },
-  { niche: 'dental', label: 'dental clinics' },
-  { niche: 'law', label: 'law firms' },
-  { niche: 'ecommerce', label: 'boutique clothing store' },
+  { niche: 'solar', label: 'solar companies', osmFilter: 'nwr["name"~"solar",i]' },
+  { niche: 'moving', label: 'moving companies', osmFilter: 'nwr["name"~"moving|movers",i]' },
+  { niche: 'insurance', label: 'insurance agencies', osmFilter: 'nwr["office"="insurance"]' },
+  { niche: 'real_estate', label: 'real estate agents', osmFilter: 'nwr["office"="estate_agent"]' },
+  { niche: 'plumbing', label: 'plumbing companies', osmFilter: 'nwr["craft"="plumber"]' },
+  { niche: 'landscaping', label: 'landscaping companies', osmFilter: 'nwr["craft"="gardener"]' },
+  { niche: 'hvac', label: 'hvac companies', osmFilter: 'nwr["craft"="hvac"]' },
+  { niche: 'dental', label: 'dental clinics', osmFilter: 'nwr["amenity"="dentist"]' },
+  { niche: 'law', label: 'law firms', osmFilter: 'nwr["office"="lawyer"]' },
+  { niche: 'ecommerce', label: 'boutique clothing store', osmFilter: 'nwr["shop"="clothes"]' },
 ];
 
-// Mix of US/UK cities. Rotated by day-of-year so a daily cron works through
-// the full set over time instead of hammering the same cities every run.
+// Mix of US/UK cities with hardcoded centers (no geocoding call needed).
+// Rotated by day-of-year so a daily cron works through the full set over
+// time instead of hammering the same cities every run.
 const CITIES = [
-  { city: 'Austin', country: 'US', label: 'Austin, TX' },
-  { city: 'Denver', country: 'US', label: 'Denver, CO' },
-  { city: 'Phoenix', country: 'US', label: 'Phoenix, AZ' },
-  { city: 'Charlotte', country: 'US', label: 'Charlotte, NC' },
-  { city: 'Manchester', country: 'UK', label: 'Manchester, UK' },
-  { city: 'Bristol', country: 'UK', label: 'Bristol, UK' },
-  { city: 'Leeds', country: 'UK', label: 'Leeds, UK' },
-  { city: 'Nottingham', country: 'UK', label: 'Nottingham, UK' },
+  { city: 'Austin', country: 'US', label: 'Austin, TX', lat: 30.2672, lon: -97.7431 },
+  { city: 'Denver', country: 'US', label: 'Denver, CO', lat: 39.7392, lon: -104.9903 },
+  { city: 'Phoenix', country: 'US', label: 'Phoenix, AZ', lat: 33.4484, lon: -112.0740 },
+  { city: 'Charlotte', country: 'US', label: 'Charlotte, NC', lat: 35.2271, lon: -80.8431 },
+  { city: 'Manchester', country: 'UK', label: 'Manchester, UK', lat: 53.4808, lon: -2.2426 },
+  { city: 'Bristol', country: 'UK', label: 'Bristol, UK', lat: 51.4545, lon: -2.5879 },
+  { city: 'Leeds', country: 'UK', label: 'Leeds, UK', lat: 53.8008, lon: -1.5491 },
+  { city: 'Nottingham', country: 'UK', label: 'Nottingham, UK', lat: 52.9548, lon: -1.1581 },
 ];
-
-// Heuristic bounds for "independently owned small business, not a chain and
-// not a ghost listing" — Places doesn't expose ownership structure, so this
-// is a proxy: enough reviews to be a real active business, not so many that
-// it's obviously a large chain/franchise.
-const SMALL_BIZ_MIN_RATINGS = 3;
-const SMALL_BIZ_MAX_RATINGS = 400;
 
 function envInt(name, fallback) {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
-const QUERIES_PER_RUN = envInt('PLACES_QUERIES_PER_RUN', 4);
-const DETAILS_PER_RUN = envInt('PLACES_DETAILS_PER_RUN', 25);
+const QUERIES_PER_RUN = envInt('OSM_QUERIES_PER_RUN', 4);
+const ELEMENTS_PER_RUN = envInt('OSM_ELEMENTS_PER_RUN', 25);
+const RADIUS_METERS = envInt('OSM_RADIUS_METERS', 12000);
 const HUNTER_MAX_CALLS_PER_RUN = envInt('HUNTER_MAX_CALLS_PER_RUN', 1);
 
 function dayOfYear() {
@@ -81,24 +78,17 @@ function extractDomain(website) {
   }
 }
 
-function looksLikeSmallIndependentBusiness(details) {
-  const ratings = details.user_ratings_total ?? 0;
-  return ratings >= SMALL_BIZ_MIN_RATINGS && ratings <= SMALL_BIZ_MAX_RATINGS;
-}
-
-function buildSignal({ queryLabel, details }) {
-  const bits = [];
-  if (!details.website) bits.push('no website found');
-  bits.push(`${queryLabel}, ${details.user_ratings_total ?? 0} reviews`);
-  return bits.join(' — ');
+function buildSignal(queryLabel) {
+  return `independent ${queryLabel} — no major brand/chain affiliation found (OpenStreetMap)`;
 }
 
 // POST /leads/source — n8n's daily scraping cron calls this. Discovers small
-// businesses via Google Places, filters for a plausible independent-owner
-// profile, finds a decision-maker email (Hunter first when it clears the
-// quality bar and quota allows, else pattern-guessing verified via MX/Reoon),
-// and upserts qualifying leads. No fixed target count — runs a capped batch
-// of query x city combos per call and reports real yield.
+// businesses via OpenStreetMap's Overpass API (free, no key/billing), filters
+// for a plausible independent-owner profile, finds a decision-maker email
+// (Hunter first when it clears the quality bar and quota allows, else
+// pattern-guessing verified via MX/Reoon), and upserts qualifying leads. No
+// fixed target count — runs a capped batch of query x city combos per call
+// and reports real yield.
 router.post('/leads/source', async (req, res) => {
   if (process.env.WEBHOOK_SECRET) {
     if (req.get('x-webhook-secret') !== process.env.WEBHOOK_SECRET) {
@@ -106,15 +96,11 @@ router.post('/leads/source', async (req, res) => {
     }
   }
 
-  if (!placesConfigured()) {
-    return res.status(400).json({ error: 'GOOGLE_PLACES_API_KEY is not configured' });
-  }
-
   const summary = {
     queries_run: 0,
-    places_found: 0,
-    places_detail_checked: 0,
-    skipped_not_small_business: 0,
+    businesses_found: 0,
+    businesses_checked: 0,
+    skipped_likely_chain: 0,
     skipped_no_website: 0,
     skipped_duplicate: 0,
     hunter_calls_used: 0,
@@ -136,47 +122,41 @@ router.post('/leads/source', async (req, res) => {
   }
 
   const combos = pickCombosForToday(QUERIES_PER_RUN);
-  let detailsChecked = 0;
+  let checked = 0;
 
   for (const { query: q, city } of combos) {
     summary.queries_run++;
-    const searchText = `${q.label} in ${city.label}`;
 
-    let places;
+    let businesses;
     try {
-      places = await searchPlaces(searchText);
+      businesses = await searchBusinesses({ osmFilter: q.osmFilter, lat: city.lat, lon: city.lon, radius: RADIUS_METERS });
     } catch (err) {
-      summary.errors.push({ query: searchText, error: err.message });
+      summary.errors.push({ query: `${q.label} in ${city.label}`, error: err.message });
       continue;
     }
-    summary.places_found += places.length;
+    summary.businesses_found += businesses.length;
 
-    for (const place of places) {
-      if (detailsChecked >= DETAILS_PER_RUN) break;
+    for (const business of businesses) {
+      if (checked >= ELEMENTS_PER_RUN) break;
+      checked++;
+      summary.businesses_checked++;
 
       try {
-        // Dedupe on place before spending a Details call: name+city match
-        // against existing leads is the closest cheap proxy we have pre-domain.
         const { rows: existingByName } = await query(
           `SELECT 1 FROM leads WHERE company = $1 AND city = $2 LIMIT 1`,
-          [place.name, city.city]
+          [business.name, city.city]
         );
         if (existingByName.length) {
           summary.skipped_duplicate++;
           continue;
         }
 
-        const details = await getPlaceDetails(place.place_id);
-        detailsChecked++;
-        summary.places_detail_checked++;
-        if (!details) continue;
-
-        if (!looksLikeSmallIndependentBusiness(details)) {
-          summary.skipped_not_small_business++;
+        if (!looksLikeIndependentBusiness(business)) {
+          summary.skipped_likely_chain++;
           continue;
         }
 
-        const domain = extractDomain(details.website);
+        const domain = extractDomain(business.website);
         if (!domain) {
           // No website means no domain to derive or verify an email against
           // — nothing actionable via this pipeline, so skip rather than guess.
@@ -194,13 +174,13 @@ router.post('/leads/source', async (req, res) => {
           continue;
         }
 
-        const signal = buildSignal({ queryLabel: q.label, details });
+        const signal = buildSignal(q.label);
 
         let contact = null;
 
         // Hunter is scarce (25/month total) — only spend it on businesses
-        // that already cleared the small-independent-business bar above,
-        // and only while this run's budget and the account's live quota allow.
+        // that already cleared the independent-business filter above, and
+        // only while this run's budget and the account's live quota allow.
         if (hunterConfigured() && hunterCallsRemainingThisRun > 0) {
           hunterCallsRemainingThisRun--;
           summary.hunter_calls_used++;
@@ -222,7 +202,7 @@ router.post('/leads/source', async (req, res) => {
         // Hunter hit or a Reoon-backed verification (set REOON_API_KEY to
         // tighten this).
         if (!contact) {
-          for (const guess of candidateEmails(domain, place.name)) {
+          for (const guess of candidateEmails(domain, business.name)) {
             summary.pattern_guesses_tried++;
             const result = await verifyEmail(guess);
             if (result.verified) {
@@ -247,14 +227,14 @@ router.post('/leads/source', async (req, res) => {
         await query(
           `INSERT INTO leads
             (email, first_name, last_name, title, company, domain, niche, city, country, source, signal, verified, catch_all, status, enrichment)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'places_scrape',$10,$11,$12,'new',$13)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'osm_scrape',$10,$11,$12,'new',$13)
            ON CONFLICT (email) DO NOTHING`,
           [
             contact.email,
             contact.firstName,
             contact.lastName,
             contact.title,
-            place.name,
+            business.name,
             domain,
             q.niche,
             city.city,
@@ -263,19 +243,19 @@ router.post('/leads/source', async (req, res) => {
             verification.verified,
             verification.catchAll,
             JSON.stringify({
-              place_id: place.place_id,
-              website: details.website,
-              rating: details.rating,
-              user_ratings_total: details.user_ratings_total,
-              formatted_phone_number: details.formatted_phone_number,
-              discovery_query: searchText,
+              osm_id: business.osmId,
+              website: business.website,
+              phone: business.phone,
+              lat: business.lat,
+              lon: business.lon,
+              discovery_query: `${q.label} in ${city.label}`,
               contact_method: contact.title ? 'hunter' : 'pattern_guess',
             }),
           ]
         );
         summary.inserted++;
       } catch (err) {
-        summary.errors.push({ place: place.name, error: err.message });
+        summary.errors.push({ business: business.name, error: err.message });
       }
     }
   }

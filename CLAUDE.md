@@ -42,7 +42,9 @@ this project deliberately moved away from.
 - `src/lib/draftCopy.js` — Claude drafting prompt + deterministic fallback
 - `src/lib/sentiment.js` — Claude reply classification + keyword fallback
 - `src/lib/verify.js` — MX check + Reoon fallback
-- `src/lib/places.js`, `hunter.js`, `emailGuess.js` — lead sourcing
+- `src/lib/osm.js`, `hunter.js`, `emailGuess.js` — lead sourcing (OSM
+  Overpass API for discovery — free, no key/billing; Google Places was
+  dropped after it moved to a $275/month minimum commitment)
 - `scripts/gmail-auth.js` — one-time local script to mint `GOOGLE_REFRESH_TOKEN`
 - `migrations/*.sql` — additive, idempotent, run manually against Railway
   Postgres (or ask Claude to run them via the public proxy connection string
@@ -102,8 +104,8 @@ falling back.
 
 ## Lead sourcing (`POST /leads/source`)
 
-Google Places (discovery + details) → small-independent-business heuristic
-(3–400 total reviews) → owner contact via Hunter.io (decision-maker titles
+OpenStreetMap Overpass API (discovery, free/no key) → independent-business
+heuristic (no `brand` tag) → owner contact via Hunter.io (decision-maker titles
 only) or pattern-guessing (`owner@`/`<guessed-firstname>@`/`info@`,
 MX/Reoon-verified) → dedupe → insert with a `signal` describing why the lead
 was picked. No fixed target count per run; yield is whatever the capped
@@ -126,7 +128,7 @@ burns one of these budgets:**
 | Service | Limit | Where it's spent | Guard rails already in place |
 |---|---|---|---|
 | **Hunter.io** | 25 domain searches / **month**, total | `/leads/source`, one call per qualifying business | `HUNTER_MAX_CALLS_PER_RUN` (default 1) + live quota check via `/account` before spending; only spent on businesses that already passed the small-business filter |
-| **Google Places** | Billed against $200/mo Google Cloud credit; Details calls are the expensive one (Text Search is cheaper) | `/leads/source` | `PLACES_QUERIES_PER_RUN` (default 4 text searches/run), `PLACES_DETAILS_PER_RUN` (default 25 details calls/run) |
+| **OSM Overpass** | Free, no key, no billing — but a shared public instance with an unwritten fair-use expectation | `/leads/source` | `OSM_QUERIES_PER_RUN` (default 4 queries/run), `OSM_ELEMENTS_PER_RUN` (default 25 businesses processed/run) |
 | **Anthropic (Claude)** | Pay-per-token, no hard free quota | `/agent/run` (drafting, ~1 call/send) + `/webhook/inbound` (sentiment, ~1 call/reply) | None beyond natural volume (bounded by lead count + daily send limits per campaign) — if drafting volume grows a lot, consider a cheaper model for sentiment classification specifically |
 | **Gmail API** | Google's standard per-user sending limits (~500/day for regular Gmail accounts) | `/agent/run` | `campaigns.daily_send_limit` per campaign, enforced in `/agent/run` before sending |
 
@@ -135,7 +137,7 @@ testing over live calls where possible (e.g. temporarily unset the relevant
 API key locally, or test against a throwaway campaign/lead you clean up
 after — this has been done before via a direct Postgres connection using the
 public proxy connection string, insert test rows, verify, then delete them).
-Don't burn real Hunter/Places/Claude/Gmail-send quota on routine
+Don't burn real Hunter/Claude/Gmail-send quota on routine
 verification unless actually confirming an end-to-end behavior change.
 
 ## Known gaps (current)

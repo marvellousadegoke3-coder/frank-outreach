@@ -58,11 +58,10 @@ npm run dev
    (optional — until all three are set, `/agent/run` logs drafted emails
    instead of sending them, so the pipeline runs safely before Gmail OAuth
    is set up; see **Sending via Gmail API** below for how to generate the
-   refresh token), `GOOGLE_PLACES_API_KEY` (required for `/leads/source`;
-   same Google Cloud project as the Gmail OAuth client, enable the "Places
-   API"), and `HUNTER_API_KEY` (optional for `/leads/source`; without it,
-   lead sourcing runs entirely on pattern-guessed emails — see **Lead
-   sourcing** below).
+   refresh token), and `HUNTER_API_KEY` (optional for `/leads/source`;
+   without it, lead sourcing runs entirely on pattern-guessed emails — see
+   **Lead sourcing** below). `/leads/source`'s discovery step uses
+   OpenStreetMap's Overpass API, which needs no key or billing account.
 6. Dashboard service — no extra env vars beyond `DATABASE_URL`.
 7. Generate a public domain for each service under Settings → Networking →
    "Generate Domain".
@@ -80,7 +79,7 @@ npm run dev
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
 | `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
 | `POST /agent/run` | **n8n's daily send cron calls this.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via the Gmail API (or logs a stub without Google OAuth creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
-| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via Google Places + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET` and `GOOGLE_PLACES_API_KEY` to be set. Returns a yield summary (`queries_run`, `places_found`, `hunter_calls_used`, `verified`, `inserted`, per-skip-reason counts, `errors`). |
+| `POST /leads/source` | **n8n's daily scraping cron calls this.** Discovers small-business decision-makers via OpenStreetMap (Overpass API, free/no key) + Hunter/pattern-guessing (see **Lead sourcing** below), verifies, and upserts qualifying leads. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a yield summary (`queries_run`, `businesses_found`, `hunter_calls_used`, `verified`, `inserted`, per-skip-reason counts, `errors`). |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
@@ -99,17 +98,30 @@ n8n's scraping cron calls this once daily. Pipeline per call:
 1. **Discovery** — rotates through a fixed list of business-type queries
    (solar, moving, insurance, real estate, plumbing, landscaping, HVAC,
    dental, law, ecommerce boutiques — see `QUERY_TEMPLATES` in
-   `backend/src/routes/sourceLeads.js`) crossed with a mix of US/UK cities,
-   deterministically offset by day-of-year so a daily cron works through new
-   ground instead of repeating itself. `PLACES_QUERIES_PER_RUN` (default 4)
-   caps how many query×city combos run per call; `PLACES_DETAILS_PER_RUN`
-   (default 25) caps the billable Place Details lookups per call.
-2. **Small-independent-business filter** — Places doesn't expose ownership
-   structure, so this is a heuristic: a business's total review count must
-   fall between 3 and 400 (enough to be a real active business, not so many
-   it's obviously a large chain). No website at all is skipped, not flagged
-   — there's no domain to derive or verify an email against, so nothing
-   downstream is actionable.
+   `backend/src/routes/sourceLeads.js`) crossed with a mix of US/UK cities
+   (hardcoded lat/lon centers, no geocoding call needed), deterministically
+   offset by day-of-year so a daily cron works through new ground instead of
+   repeating itself. Search runs against **OpenStreetMap's Overpass API** —
+   free, no API key, no billing account — via `backend/src/lib/osm.js`. Each
+   query matches a standard OSM tag where one exists (`office=insurance`,
+   `office=estate_agent`, `craft=plumber`, `craft=gardener`, `craft=hvac`,
+   `amenity=dentist`, `office=lawyer`, `shop=clothes`) or a name-regex match
+   for the two categories with no dedicated tag (solar, moving).
+   `OSM_QUERIES_PER_RUN` (default 4) caps how many query×city combos run per
+   call; `OSM_RADIUS_METERS` (default 12000) sets the search radius around
+   each city center; `OSM_ELEMENTS_PER_RUN` (default 25) caps how many
+   returned businesses get processed for owner-contact lookup per call.
+2. **Independent-business filter** — OSM carries no review/rating data the
+   way Places did, so the heuristic instead checks OSM's `brand` tag (the
+   standard convention for chain/franchise locations, e.g. `brand=Starbucks`)
+   — its absence is the proxy for "independently owned". No website at all
+   is skipped, not flagged — there's no domain to derive or verify an email
+   against, so nothing downstream is actionable. **Caveat found during
+   testing**: OSM tagging is contributor-driven and inconsistent — e.g.
+   individual State Farm insurance agents showed up untagged with `brand`
+   even though "State Farm" is in the business name, so they passed this
+   filter. The heuristic catches obvious chains, not every franchise
+   arrangement; it's a proxy, not a guarantee.
 3. **Owner contact** — Hunter.io domain search first (25 free searches/month
    **total**, so it's spent only on businesses that already cleared the
    filter above, capped per run by `HUNTER_MAX_CALLS_PER_RUN` (default 1)
@@ -125,8 +137,9 @@ n8n's scraping cron calls this once daily. Pipeline per call:
 4. **Dedupe** — skipped if the business (name+city) or domain already exists
    in `leads`, or the domain already appears in `suppression`.
 5. **Signal tagging** — `leads.signal` is populated with why the lead was
-   picked (e.g. `"solar companies, 47 reviews — no website found"`), which
-   is what the drafting prompt grounds copy in.
+   picked (e.g. `"independent solar companies — no major brand/chain
+   affiliation found (OpenStreetMap)"`), which is what the drafting prompt
+   grounds copy in.
 6. No fixed target count — it runs the capped batch of query×city combos for
    that call and reports real per-run yield in the JSON response.
 
@@ -138,8 +151,8 @@ person or title** — `owner@domain` and `info@domain` are just plausible
 addresses that passed a mail-server-exists check, not evidence the mailbox
 belongs to an actual owner. `enrichment.contact_method` on each lead records
 which path found it (`"hunter"` vs `"pattern_guess"`), so you can see which
-leads have real seniority confidence and which are inferred from Places'
-review-count heuristic alone. The drafting prompt still writes
+leads have real seniority confidence and which are inferred from the
+brand-tag heuristic alone. The drafting prompt still writes
 founder-to-founder copy for every lead regardless of `contact_method` —
 tightening that (e.g. softer tone for `pattern_guess` leads, or skipping
 `info@` contacts from the founder-to-founder framing entirely) is a
@@ -157,17 +170,18 @@ recommended before scaling up pattern-guessed volume.
 
 - **Google Custom Search JSON API** (100 free queries/day) to detect hiring
   signals directly (e.g. `site:indeed.com "front desk" "[company]"`) instead
-  of only inferring signal from Places metadata — highest-value addition,
-  but needs its own API key + Custom Search Engine setup. Recommend adding
-  as a follow-up once you've seen real yield/quality from the Places+Hunter
-  pipeline, not bundled into this first version.
+  of only inferring signal from OSM tags — highest-value addition, but needs
+  its own API key + Custom Search Engine setup (no billing account required
+  at this quota). Recommend adding as a follow-up once you've seen real
+  yield/quality from the OSM+Hunter pipeline, not bundled into this first
+  version.
 - **Yelp Fusion API** (free tier) as a second discovery source alongside
-  Places — some independent businesses have a Yelp presence without a
-  Google Business listing, or vice versa. Worth adding for coverage once
-  Places' yield plateaus.
+  OSM — some independent businesses have a Yelp presence without an OSM
+  listing (OSM coverage is contributor-driven and uneven by region), or vice
+  versa. Worth adding for coverage once OSM's yield plateaus.
 - **OpenCorporates API** (free tier, rate-limited) to sharpen the
-  independent-vs-franchise heuristic beyond the review-count proxy —
-  lower priority; the current heuristic is workable to start.
+  independent-vs-franchise heuristic beyond the brand-tag proxy — lower
+  priority; the current heuristic is workable to start.
 
 ## Sending via Gmail API
 
@@ -225,7 +239,7 @@ follow-ups, all server-side:
 - **HTTP Request** node — `POST https://<backend-domain>/agent/run`, header
   `x-webhook-secret: <your WEBHOOK_SECRET>`, no body needed.
 
-**2. Daily lead sourcing** — discovers new leads via Places/Hunter and
+**2. Daily lead sourcing** — discovers new leads via OpenStreetMap/Hunter and
 upserts qualifying ones:
 - **Schedule Trigger** node — once daily, ideally *before* the send cron so
   freshly sourced leads are eligible for that day's send run.
