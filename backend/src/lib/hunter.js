@@ -19,7 +19,9 @@ export async function getHunterQuota() {
   const apiKey = getApiKey();
   if (!apiKey) return null;
 
-  const res = await fetch(`https://api.hunter.io/v2/account?api_key=${encodeURIComponent(apiKey)}`);
+  const res = await fetch(`https://api.hunter.io/v2/account?api_key=${encodeURIComponent(apiKey)}`, {
+    signal: AbortSignal.timeout(15000),
+  });
   if (!res.ok) return null;
   const data = await res.json();
 
@@ -36,7 +38,7 @@ export async function hunterDomainSearch(domain) {
   if (!apiKey) return null;
 
   const url = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&api_key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) {
     if (res.status === 429 || res.status === 403) return null; // quota exhausted mid-run
     throw new Error(`Hunter domain search failed: ${res.status}`);

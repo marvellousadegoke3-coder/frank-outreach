@@ -23,7 +23,7 @@ async function reoonCheck(email) {
     email
   )}&key=${encodeURIComponent(apiKey)}&mode=power`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) return null;
   const data = await res.json();
 

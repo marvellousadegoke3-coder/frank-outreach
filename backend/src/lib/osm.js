@@ -53,6 +53,13 @@ export async function searchBusinesses({ osmFilter, lat, lon, radius }) {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain', 'User-Agent': USER_AGENT },
         body: query,
+        // Without this, a network-level stall (not an HTTP error — the
+        // connection just never responds) hangs forever, since fetch has no
+        // default timeout. Observed exactly this in production: a run sat
+        // in "already_running" for 12+ minutes on one stuck query. Overpass's
+        // own [timeout:40] only bounds ITS processing time, not the network
+        // round-trip, so this needs to be slightly longer, not the same.
+        signal: AbortSignal.timeout(45000),
       });
       if (!res.ok) throw new Error(`Overpass query failed: ${res.status}`);
       const data = await res.json();
