@@ -76,6 +76,10 @@ export async function draftMessage({ step, lead }) {
 
     return { subject: String(parsed.subject).toLowerCase().trim(), body: String(parsed.body).trim() };
   } catch (err) {
+    console.error(
+      `[draftCopy] Claude call failed, using fallback template — status=${err.status ?? 'n/a'} message=${err.message}`,
+      err.error ?? ''
+    );
     return fallbackDraft(step, lead);
   }
 }

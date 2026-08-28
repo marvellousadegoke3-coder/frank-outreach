@@ -48,6 +48,10 @@ export async function classifySentiment({ subject, body }) {
     const label = LABELS.find((l) => text.includes(l));
     return { sentiment: label || 'neutral', method: 'claude' };
   } catch (err) {
+    console.error(
+      `[sentiment] Claude call failed, using keyword fallback — status=${err.status ?? 'n/a'} message=${err.message}`,
+      err.error ?? ''
+    );
     return { sentiment: keywordFallback(`${subject}\n${body}`), method: 'keyword_fallback_after_error' };
   }
 }
