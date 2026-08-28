@@ -87,6 +87,22 @@ campaign's `daily_send_limit` (skipping once the day's cap is hit). A lead
 with no matching active campaign is skipped (`skipped_no_campaign`) — make
 sure every niche you're sending to has an active campaign row.
 
+## Known gap: no seniority filtering on leads
+
+The drafting prompt assumes every lead is a decision-maker (CEO, founder,
+owner, or principal/managing partner) and writes founder-to-founder copy on
+that assumption — but the `leads` table has no `title`/`seniority` column,
+and nothing in this backend filters or verifies seniority. Right now
+whatever populates `leads` (lead sourcing/scraping isn't built yet) is
+implicitly responsible for only inserting decision-maker contacts.
+
+Before wiring up real lead sourcing, either add a `title` (or similar)
+column to `leads` and filter `/agent/run`'s candidate query on it, or at
+minimum have the sourcing step store the scraped title in `enrichment` and
+add that filter then. Until one of those exists, a non-decision-maker lead
+that slips into the table will still get founder-to-founder copy addressed
+to someone who isn't the owner.
+
 ## Sending via Gmail API
 
 `/agent/run` sends through the Gmail API (`users.messages.send`) using an
