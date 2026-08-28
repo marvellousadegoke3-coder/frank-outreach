@@ -13,9 +13,10 @@ env vars, drafting rules, or known gaps change — it decays fast otherwise.
 ## Architecture
 
 ```
-n8n Cloud (2 daily cron triggers, no other logic)
-  → POST /leads/source   (backend decides who's a lead, at all)
-  → POST /agent/run      (backend decides who to email today, drafts, sends)
+n8n Cloud (2 daily cron triggers + 1 inbound relay, no other logic)
+  → POST /leads/source     (backend decides who's a lead, at all)
+  → POST /agent/run        (backend decides who to email today, drafts, sends)
+  Gmail Trigger (watches sending inbox) → POST /webhook/inbound
        ↓
   backend (Express/ESM, Railway service "frank-outreach")
        ↓
@@ -24,11 +25,19 @@ n8n Cloud (2 daily cron triggers, no other logic)
   dashboard (Express + Chart.js, Railway service "dashboard", reads-only)
 ```
 
-n8n's *only* job is firing two scheduled HTTP requests with the
+n8n's *only* job is firing two scheduled HTTP requests and relaying whatever
+lands in the sending inbox to `/webhook/inbound`, all with the
 `x-webhook-secret` header. All decisioning — lead qualification, drafting,
-sending, follow-up cadence, suppression, reply handling — lives in the
-backend. Do not push logic back into n8n; that was an earlier architecture
-this project deliberately moved away from.
+sending, follow-up cadence, suppression, reply/bounce handling — lives in
+the backend. Do not push logic back into n8n; that was an earlier
+architecture this project deliberately moved away from.
+
+**All three n8n workflows are live, not just planned**: the two cron
+triggers, and a Gmail Trigger node watching the sending inbox → HTTP
+Request node → `POST /webhook/inbound` (tested live with a real inbound
+email; correctly classified as `auto_reply`, no false lead match, nothing
+wrongly suppressed). Don't describe the inbound relay as a pending setup
+step elsewhere in this file or the README.
 
 ## Backend structure
 

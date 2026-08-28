@@ -333,12 +333,14 @@ upserts qualifying ones:
 That's it for both. The backend decides everything — n8n just has to fire
 two crons.
 
-For inbound replies, point your inbox-monitoring trigger (IMAP/Gmail trigger
-node polling the sending inbox) at a workflow that ends with an HTTP Request
-node calling `POST https://<backend-domain>/webhook/inbound`, header
+**3. Inbound relay — live, not pending.** A Gmail Trigger node watches the
+sending inbox and an HTTP Request node forwards to
+`POST https://<backend-domain>/webhook/inbound`, header
 `x-webhook-secret: <your WEBHOOK_SECRET>`, body either
 `{ "raw": "<full .eml source>" }` or the parsed fields directly:
 `{ "from": "...", "subject": "...", "text": "...", "in_reply_to": "...", "references": [...] }`.
+Tested live with a real inbound email — correctly classified as
+`auto_reply`, no false lead match, nothing wrongly suppressed.
 
 **Dashboard**: no n8n wiring needed — it just reads `messages`/`events`
 directly. Open `https://<dashboard-domain>` any time to see live totals.
