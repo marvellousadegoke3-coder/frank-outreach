@@ -34,8 +34,9 @@ export async function classifySentiment({ subject, body }) {
     const msg = await client.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: 20,
+      thinking: { type: 'disabled' },
       system:
-        `Classify the sentiment of a cold-outreach email reply. Respond with exactly one word from this list, nothing else: ${LABELS.join(', ')}.`,
+        `Classify the sentiment of a cold-outreach email reply. Respond with exactly one word from this list, nothing else: ${LABELS.join(', ')}. Do not include any internal or system tags in your response.`,
       messages: [
         {
           role: 'user',
@@ -44,7 +45,10 @@ export async function classifySentiment({ subject, body }) {
       ],
     });
 
-    const text = msg.content?.[0]?.text?.trim().toLowerCase() ?? '';
+    // Sonnet 5 has adaptive thinking on by default, so content[0] is often a
+    // thinking block rather than text — find the actual text block instead
+    // of assuming position 0.
+    const text = msg.content?.find((block) => block.type === 'text')?.text?.trim().toLowerCase() ?? '';
     const label = LABELS.find((l) => text.includes(l));
     return { sentiment: label || 'neutral', method: 'claude' };
   } catch (err) {

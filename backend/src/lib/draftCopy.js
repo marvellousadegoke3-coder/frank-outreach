@@ -61,16 +61,21 @@ export async function draftMessage({ step, lead }) {
     const msg = await client.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: 300,
+      thinking: { type: 'disabled' },
       system:
         `You write short cold outreach emails for a B2B AI automation agency. Write ${angle}. ` +
         'Rules: body under 100 words, plain text only (no markdown), exactly one soft call-to-action, ' +
         "grounded in the lead's niche/company/signal given below, no generic filler or hype. " +
         'Subject must be lowercase, under 4 words, no punctuation. ' +
+        'Do not include any internal or system tags in your response. ' +
         'Respond with ONLY a JSON object: {"subject": "...", "body": "..."}',
       messages: [{ role: 'user', content: context }],
     });
 
-    const text = msg.content?.[0]?.text ?? '';
+    // Sonnet 5 has adaptive thinking on by default, so content[0] is often a
+    // thinking block rather than text — find the actual text block instead
+    // of assuming position 0.
+    const text = msg.content?.find((block) => block.type === 'text')?.text ?? '';
     const parsed = JSON.parse(extractJson(text));
     if (!parsed.subject || !parsed.body) throw new Error('missing subject/body in draft response');
 
