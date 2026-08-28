@@ -98,6 +98,16 @@ router.post('/webhook/inbound', async (req, res) => {
       await query(`UPDATE messages SET status = 'replied' WHERE id = $1`, [message.id]);
     }
 
+    // Any reply, regardless of sentiment, hands the lead to a human and
+    // permanently excludes it from /agent/run's follow-up selection (that
+    // query checks for the presence of a reply event on the lead).
+    if (lead) {
+      await query(
+        `UPDATE leads SET status = 'needs_human_reply', updated_at = now() WHERE id = $1`,
+        [lead.id]
+      );
+    }
+
     let suppressed = false;
     if (sentiment === 'unsubscribe') {
       await query(

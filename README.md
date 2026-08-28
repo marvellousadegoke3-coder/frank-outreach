@@ -1,7 +1,9 @@
 # Frank Outreach
 
 B2B lead-gen and cold outreach backend + dashboard for Frank Digitals, deployed on
-Railway from this repo, driven by n8n Cloud for scraping/sending.
+Railway from this repo. n8n Cloud's only job is a daily cron that hits
+`POST /agent/run` — everything else (who to email, drafting copy, sending,
+follow-up scheduling) lives in the backend.
 
 ## Structure
 
@@ -46,10 +48,15 @@ npm run dev
    existing Postgres plugin — in Railway you can do this with a variable
    reference (`${{Postgres.DATABASE_URL}}`) instead of pasting the string,
    so it stays in sync if the DB ever migrates.
-5. Backend service — also set: `WEBHOOK_SECRET` (pick a random string),
-   `ANTHROPIC_API_KEY` (optional, enables Claude-based reply classification),
+5. Backend service — also set: `WEBHOOK_SECRET` (pick a random string, shared
+   with n8n), `ANTHROPIC_API_KEY` (optional, enables Claude-based reply
+   classification and copy drafting — without it, drafting falls back to a
+   fixed template and sentiment falls back to a keyword heuristic),
    `REOON_API_KEY` (optional, enables verification fallback), `CORS_ORIGIN`
-   (set to your dashboard's Railway URL once you have it, or leave `*`).
+   (set to your dashboard's Railway URL once you have it, or leave `*`),
+   and `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS` (optional — until
+   these are set, `/agent/run` logs drafted emails instead of sending them,
+   so the whole pipeline runs safely before your mailbox is ready).
 6. Dashboard service — no extra env vars beyond `DATABASE_URL`.
 7. Generate a public domain for each service under Settings → Networking →
    "Generate Domain".
@@ -65,46 +72,40 @@ npm run dev
 | `POST /messages` | Create a message record |
 | `PATCH /messages/:id/sent` | Mark a message sent |
 | `PATCH /messages/:id/bounced` | Mark bounced, logs a `bounced` event |
-| `POST /webhook/inbound` | n8n posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
+| `POST /webhook/inbound` | n8n (or your inbox provider) posts inbound replies here; classifies sentiment (Claude if `ANTHROPIC_API_KEY` set, else keyword heuristic), logs an event, sets the lead's status to `needs_human_reply` (permanently excluding it from `/agent/run`, regardless of sentiment), and auto-suppresses on `unsubscribe` sentiment. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. |
+| `POST /agent/run` | **The only endpoint n8n's cron calls.** Selects leads due for step 1 (no message sent yet), step 2 (step 1 sent 2+ days ago, no step 2 yet), or step 3 (step 1 sent 5+ days ago, no step 3 yet) — excluding anything suppressed or with any reply ever logged. For each: checks suppression, drafts subject/body with Claude (fixed template fallback without a key), sends via SMTP (or logs a stub without SMTP creds), and logs the `messages` row + a `sent` event. Requires `x-webhook-secret` header matching `WEBHOOK_SECRET`. Returns a JSON summary (`processed`, `sent`, `skipped_suppressed`, `skipped_no_campaign`, `skipped_daily_limit`, `errors`). |
 | `GET /suppression/check?email=` | Check if an email is suppressed |
 | `POST /suppression` | Add a suppression record |
 | `POST /events` | Log a generic event (`delivered`, `opened`, `clicked`, etc.) |
 | `GET /health` | Health check |
 
+Note: `/agent/run` picks a campaign for each lead by matching `campaigns.niche`
+to the lead's `niche` where `campaigns.status = 'active'`, and respects that
+campaign's `daily_send_limit` (skipping once the day's cap is hit). A lead
+with no matching active campaign is skipped (`skipped_no_campaign`) — make
+sure every niche you're sending to has an active campaign row.
+
 ## Connecting to n8n Cloud
 
-Once both services have public Railway domains:
+Once the backend has a public Railway domain, n8n's role is just one workflow:
 
-1. **Lead intake**: in your scraping workflow, add an HTTP Request node —
-   `POST https://<backend-domain>/leads` with the scraped fields as JSON body.
-   It upserts on email, so re-running scrapes is safe.
+1. **Schedule Trigger** node — set to run once daily (pick whatever time you
+   want sends to go out).
+2. **HTTP Request** node — `POST https://<backend-domain>/agent/run`, header
+   `x-webhook-secret: <your WEBHOOK_SECRET>`, no body needed.
 
-2. **Verification**: after scraping (or right before sending), call
-   `POST https://<backend-domain>/verify` with `{ "email": "...", "lead_id": ... }`.
-   It updates the lead's `verified`/`catch_all` columns and returns the result
-   so you can branch the workflow (e.g. skip sending if `verified: false`).
+That's it. The backend decides who to email, drafts the copy, sends it, and
+schedules the next follow-up step on its own — n8n just has to fire the cron.
 
-3. **Suppression gate**: before sending, call
-   `GET https://<backend-domain>/suppression/check?email=...` and skip the
-   send if `suppressed: true`.
+For inbound replies, point your inbox-monitoring trigger (IMAP/Gmail trigger
+node polling the sending inbox) at a workflow that ends with an HTTP Request
+node calling `POST https://<backend-domain>/webhook/inbound`, header
+`x-webhook-secret: <your WEBHOOK_SECRET>`, body either
+`{ "raw": "<full .eml source>" }` or the parsed fields directly:
+`{ "from": "...", "subject": "...", "text": "...", "in_reply_to": "...", "references": [...] }`.
 
-4. **Send step**: after your sending node (Gmail/SMTP/inbox provider) actually
-   sends, call `PATCH https://<backend-domain>/messages/:id/sent` with the
-   provider's `message_id`/`thread_id` so replies can be matched later. If the
-   send bounces, call `PATCH .../messages/:id/bounced` instead.
-
-5. **Inbound replies**: point your inbox-monitoring trigger (IMAP/Gmail
-   trigger node polling the sending inbox) at a workflow that ends with an
-   HTTP Request node calling `POST https://<backend-domain>/webhook/inbound`.
-   Send header `x-webhook-secret: <your WEBHOOK_SECRET>` and body either
-   `{ "raw": "<full .eml source>" }` or the parsed fields directly:
-   `{ "from": "...", "subject": "...", "text": "...", "in_reply_to": "...", "references": [...] }`.
-   The endpoint classifies sentiment, logs an `events` row, marks the message
-   `replied`, and auto-adds to `suppression` if the reply reads as an
-   unsubscribe request.
-
-6. **Dashboard**: no n8n wiring needed — it just reads `messages`/`events`
-   directly. Open `https://<dashboard-domain>` any time to see live totals.
+**Dashboard**: no n8n wiring needed — it just reads `messages`/`events`
+directly. Open `https://<dashboard-domain>` any time to see live totals.
 
 ## Push to GitHub
 
